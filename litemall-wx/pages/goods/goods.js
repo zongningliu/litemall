@@ -6,6 +6,7 @@ var user = require('../../utils/user.js');
 
 Page({
   data: {
+    canShare: false,
     id: 0,
     goods: {},
     groupon: [], //该商品支持的团购规格
@@ -166,7 +167,8 @@ Page({
           userHasCollect: res.data.userHasCollect,
           shareImage: res.data.shareImage,
           checkedSpecPrice: res.data.info.retailPrice,
-          groupon: res.data.groupon
+          groupon: res.data.groupon,
+          canShare: res.data.share,
         });
 
         //如果是通过分享的团购参加团购，则团购项目应该与分享的一致并且不可更改
@@ -210,7 +212,7 @@ Page({
     }).then(function(res) {
       if (res.errno === 0) {
         that.setData({
-          relatedGoods: res.data.goodsList,
+          relatedGoods: res.data.list,
         });
       }
     });
@@ -467,23 +469,15 @@ Page({
         valueId: this.data.id
       }, "POST")
       .then(function(res) {
-        let _res = res;
-        if (_res.errno == 0) {
-          if (_res.data.type == 'add') {
-            that.setData({
-              collectImage: that.data.hasCollectImage
-            });
-          } else {
-            that.setData({
-              collectImage: that.data.noCollectImage
-            });
-          }
-
+        if (that.data.userHasCollect == 1) {
+          that.setData({
+            collectImage: that.data.noCollectImage,
+            userHasCollect: 0
+          });
         } else {
-          wx.showToast({
-            image: '/static/images/icon_error.png',
-            title: _res.errmsg,
-            mask: true
+          that.setData({
+            collectImage: that.data.hasCollectImage,
+            userHasCollect: 1
           });
         }
 
@@ -687,17 +681,6 @@ Page({
   onReady: function() {
     // 页面渲染完成
 
-  },
-  // 下拉刷新
-  onPullDownRefresh() {
-    wx.showNavigationBarLoading() //在标题栏中显示加载
-    this.getGoodsInfo();
-    wx.hideNavigationBarLoading() //完成停止加载
-    wx.stopPullDownRefresh() //停止下拉刷新
-  },
-  //根据已选的值，计算其它值的状态
-  setSpecValueStatus: function() {
-
-  },
+  }
 
 })

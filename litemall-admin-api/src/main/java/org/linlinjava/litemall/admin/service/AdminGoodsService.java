@@ -1,10 +1,9 @@
 package org.linlinjava.litemall.admin.service;
 
-import com.github.pagehelper.PageInfo;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.linlinjava.litemall.admin.dao.GoodsAllinone;
-import org.linlinjava.litemall.admin.util.CatVo;
+import org.linlinjava.litemall.admin.dto.GoodsAllinone;
+import org.linlinjava.litemall.admin.vo.CatVo;
 import org.linlinjava.litemall.core.qcode.QCodeService;
 import org.linlinjava.litemall.core.util.ResponseUtil;
 import org.linlinjava.litemall.db.domain.*;
@@ -21,7 +20,6 @@ import java.util.List;
 import java.util.Map;
 
 import static org.linlinjava.litemall.admin.util.AdminResponseCode.GOODS_NAME_EXIST;
-import static org.linlinjava.litemall.admin.util.AdminResponseCode.GOODS_UPDATE_NOT_ALLOWED;
 
 @Service
 public class AdminGoodsService {
@@ -42,20 +40,12 @@ public class AdminGoodsService {
     @Autowired
     private LitemallCartService cartService;
     @Autowired
-    private LitemallOrderGoodsService orderGoodsService;
-
-    @Autowired
     private QCodeService qCodeService;
 
-    public Object list(String goodsSn, String name,
+    public Object list(Integer goodsId, String goodsSn, String name,
                        Integer page, Integer limit, String sort, String order) {
-        List<LitemallGoods> goodsList = goodsService.querySelective(goodsSn, name, page, limit, sort, order);
-        long total = PageInfo.of(goodsList).getTotal();
-        Map<String, Object> data = new HashMap<>();
-        data.put("total", total);
-        data.put("items", goodsList);
-
-        return ResponseUtil.ok(data);
+        List<LitemallGoods> goodsList = goodsService.querySelective(goodsId, goodsSn, name, page, limit, sort, order);
+        return ResponseUtil.okList(goodsList);
     }
 
     private Object validate(GoodsAllinone goodsAllinone) {
@@ -130,19 +120,25 @@ public class AdminGoodsService {
 
     /**
      * 编辑商品
-     * <p>
-     * TODO
-     * 目前商品修改的逻辑是
-     * 1. 更新litemall_goods表
-     * 2. 逻辑删除litemall_goods_specification、litemall_goods_attribute、litemall_goods_product
-     * 3. 添加litemall_goods_specification、litemall_goods_attribute、litemall_goods_product
-     * <p>
-     * 这里商品三个表的数据采用删除再添加的策略是因为
-     * 商品编辑页面，支持管理员添加删除商品规格、添加删除商品属性，因此这里仅仅更新是不可能的，
-     * 只能删除三个表旧的数据，然后添加新的数据。
-     * 但是这里又会引入新的问题，就是存在订单商品货品ID指向了失效的商品货品表。
-     * 因此这里会拒绝管理员编辑商品，如果订单或购物车中存在商品。
-     * 所以这里可能需要重新设计。
+     *
+     * NOTE：
+     * 由于商品涉及到四个表，特别是litemall_goods_product表依赖litemall_goods_specification表，
+     * 这导致允许所有字段都是可编辑会带来一些问题，因此这里商品编辑功能是受限制：
+     * （1）litemall_goods表可以编辑字段；
+     * （2）litemall_goods_specification表只能编辑pic_url字段，其他操作不支持；
+     * （3）litemall_goods_product表只能编辑price, number和url字段，其他操作不支持；
+     * （4）litemall_goods_attribute表支持编辑、添加和删除操作。
+     *
+     * NOTE2:
+     * 前后端这里使用了一个小技巧：
+     * 如果前端传来的update_time字段是空，则说明前端已经更新了某个记录，则这个记录会更新；
+     * 否则说明这个记录没有编辑过，无需更新该记录。
+     *
+     * NOTE3:
+     * （1）购物车缓存了一些商品信息，因此需要及时更新。
+     * 目前这些字段是goods_sn, goods_name, price, pic_url。
+     * （2）但是订单里面的商品信息则是不会更新。
+     * 如果订单是未支付订单，此时仍然以旧的价格支付。
      */
     @Transactional
     public Object update(GoodsAllinone goodsAllinone) {
@@ -156,16 +152,6 @@ public class AdminGoodsService {
         LitemallGoodsSpecification[] specifications = goodsAllinone.getSpecifications();
         LitemallGoodsProduct[] products = goodsAllinone.getProducts();
 
-        Integer id = goods.getId();
-        // 检查是否存在购物车商品或者订单商品
-        // 如果存在则拒绝修改商品。
-        if (orderGoodsService.checkExist(id)) {
-            return ResponseUtil.fail(GOODS_UPDATE_NOT_ALLOWED, "商品已经在订单中，不能修改");
-        }
-        if (cartService.checkExist(id)) {
-            return ResponseUtil.fail(GOODS_UPDATE_NOT_ALLOWED, "商品已经在购物车中，不能修改");
-        }
-
         //将生成的分享图片地址写入数据库
         String url = qCodeService.createGoodShareImage(goods.getId().toString(), goods.getPicUrl(), goods.getName());
         goods.setShareUrl(url);
@@ -176,28 +162,43 @@ public class AdminGoodsService {
         }
 
         Integer gid = goods.getId();
-        specificationService.deleteByGid(gid);
-        attributeService.deleteByGid(gid);
-        productService.deleteByGid(gid);
 
         // 商品规格表litemall_goods_specification
         for (LitemallGoodsSpecification specification : specifications) {
-            specification.setGoodsId(goods.getId());
-            specificationService.add(specification);
-        }
-
-        // 商品参数表litemall_goods_attribute
-        for (LitemallGoodsAttribute attribute : attributes) {
-            attribute.setGoodsId(goods.getId());
-            attributeService.add(attribute);
+            // 目前只支持更新规格表的图片字段
+            if(specification.getUpdateTime() == null){
+                specification.setSpecification(null);
+                specification.setValue(null);
+                specificationService.updateById(specification);
+            }
         }
 
         // 商品货品表litemall_product
         for (LitemallGoodsProduct product : products) {
-            product.setGoodsId(goods.getId());
-            productService.add(product);
+            if(product.getUpdateTime() == null) {
+                productService.updateById(product);
+            }
         }
-        qCodeService.createGoodShareImage(goods.getId().toString(), goods.getPicUrl(), goods.getName());
+
+        // 商品参数表litemall_goods_attribute
+        for (LitemallGoodsAttribute attribute : attributes) {
+            if (attribute.getId() == null || attribute.getId().equals(0)){
+                attribute.setGoodsId(goods.getId());
+                attributeService.add(attribute);
+            }
+            else if(attribute.getDeleted()){
+                attributeService.deleteByGid(attribute.getId());
+            }
+            else if(attribute.getUpdateTime() == null){
+                attributeService.updateById(attribute);
+            }
+        }
+
+        // 这里需要注意的是购物车litemall_cart有些字段是拷贝商品的一些字段，因此需要及时更新
+        // 目前这些字段是goods_sn, goods_name, price, pic_url
+        for (LitemallGoodsProduct product : products) {
+            cartService.updateProduct(product.getId(), goods.getGoodsSn(), goods.getName(), product.getPrice(), product.getUrl());
+        }
 
         return ResponseUtil.ok();
     }

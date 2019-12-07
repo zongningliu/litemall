@@ -3,8 +3,10 @@ package org.linlinjava.litemall.wx.service;
 import com.github.binarywang.wxpay.bean.notify.WxPayNotifyResponse;
 import com.github.binarywang.wxpay.bean.notify.WxPayOrderNotifyResult;
 import com.github.binarywang.wxpay.bean.order.WxPayMpOrderResult;
+import com.github.binarywang.wxpay.bean.order.WxPayMwebOrderResult;
 import com.github.binarywang.wxpay.bean.request.WxPayUnifiedOrderRequest;
 import com.github.binarywang.wxpay.bean.result.BaseWxPayResult;
+import com.github.binarywang.wxpay.constant.WxPayConstants;
 import com.github.binarywang.wxpay.exception.WxPayException;
 import com.github.binarywang.wxpay.service.WxPayService;
 import org.apache.commons.io.IOUtils;
@@ -16,6 +18,7 @@ import org.linlinjava.litemall.core.notify.NotifyService;
 import org.linlinjava.litemall.core.notify.NotifyType;
 import org.linlinjava.litemall.core.qcode.QCodeService;
 import org.linlinjava.litemall.core.system.SystemConfig;
+import org.linlinjava.litemall.core.task.TaskService;
 import org.linlinjava.litemall.core.util.DateTimeUtil;
 import org.linlinjava.litemall.core.util.JacksonUtil;
 import org.linlinjava.litemall.core.util.ResponseUtil;
@@ -24,7 +27,8 @@ import org.linlinjava.litemall.db.service.*;
 import org.linlinjava.litemall.db.util.CouponUserConstant;
 import org.linlinjava.litemall.db.util.OrderHandleOption;
 import org.linlinjava.litemall.db.util.OrderUtil;
-import org.linlinjava.litemall.wx.util.IpUtil;
+import org.linlinjava.litemall.core.util.IpUtil;
+import org.linlinjava.litemall.wx.task.OrderUnpaidTask;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -103,17 +107,8 @@ public class WxOrderService {
     private LitemallCouponUserService couponUserService;
     @Autowired
     private CouponVerifyService couponVerifyService;
-
-    private String detailedAddress(LitemallAddress litemallAddress) {
-        Integer provinceId = litemallAddress.getProvinceId();
-        Integer cityId = litemallAddress.getCityId();
-        Integer areaId = litemallAddress.getAreaId();
-        String provinceName = regionService.findById(provinceId).getName();
-        String cityName = regionService.findById(cityId).getName();
-        String areaName = regionService.findById(areaId).getName();
-        String fullRegion = provinceName + " " + cityName + " " + areaName;
-        return fullRegion + " " + litemallAddress.getAddress();
-    }
+    @Autowired
+    private TaskService taskService;
 
     /**
      * 订单列表
@@ -126,35 +121,34 @@ public class WxOrderService {
      *                 3，待收货；
      *                 4，待评价。
      * @param page     分页页数
-     * @param size     分页大小
+     * @param limit     分页大小
      * @return 订单列表
      */
-    public Object list(Integer userId, Integer showType, Integer page, Integer size) {
+    public Object list(Integer userId, Integer showType, Integer page, Integer limit, String sort, String order) {
         if (userId == null) {
             return ResponseUtil.unlogin();
         }
 
         List<Short> orderStatus = OrderUtil.orderStatus(showType);
-        List<LitemallOrder> orderList = orderService.queryByOrderStatus(userId, orderStatus);
-        int count = orderService.countByOrderStatus(userId, orderStatus);
+        List<LitemallOrder> orderList = orderService.queryByOrderStatus(userId, orderStatus, page, limit, sort, order);
 
         List<Map<String, Object>> orderVoList = new ArrayList<>(orderList.size());
-        for (LitemallOrder order : orderList) {
+        for (LitemallOrder o : orderList) {
             Map<String, Object> orderVo = new HashMap<>();
-            orderVo.put("id", order.getId());
-            orderVo.put("orderSn", order.getOrderSn());
-            orderVo.put("actualPrice", order.getActualPrice());
-            orderVo.put("orderStatusText", OrderUtil.orderStatusText(order));
-            orderVo.put("handleOption", OrderUtil.build(order));
+            orderVo.put("id", o.getId());
+            orderVo.put("orderSn", o.getOrderSn());
+            orderVo.put("actualPrice", o.getActualPrice());
+            orderVo.put("orderStatusText", OrderUtil.orderStatusText(o));
+            orderVo.put("handleOption", OrderUtil.build(o));
 
-            LitemallGroupon groupon = grouponService.queryByOrderId(order.getId());
+            LitemallGroupon groupon = grouponService.queryByOrderId(o.getId());
             if (groupon != null) {
                 orderVo.put("isGroupin", true);
             } else {
                 orderVo.put("isGroupin", false);
             }
 
-            List<LitemallOrderGoods> orderGoodsList = orderGoodsService.queryByOid(order.getId());
+            List<LitemallOrderGoods> orderGoodsList = orderGoodsService.queryByOid(o.getId());
             List<Map<String, Object>> orderGoodsVoList = new ArrayList<>(orderGoodsList.size());
             for (LitemallOrderGoods orderGoods : orderGoodsList) {
                 Map<String, Object> orderGoodsVo = new HashMap<>();
@@ -162,6 +156,8 @@ public class WxOrderService {
                 orderGoodsVo.put("goodsName", orderGoods.getGoodsName());
                 orderGoodsVo.put("number", orderGoods.getNumber());
                 orderGoodsVo.put("picUrl", orderGoods.getPicUrl());
+                orderGoodsVo.put("specifications", orderGoods.getSpecifications());
+                orderGoodsVo.put("price",orderGoods.getPrice());
                 orderGoodsVoList.add(orderGoodsVo);
             }
             orderVo.put("goodsList", orderGoodsVoList);
@@ -169,11 +165,7 @@ public class WxOrderService {
             orderVoList.add(orderVo);
         }
 
-        Map<String, Object> result = new HashMap<>();
-        result.put("count", count);
-        result.put("data", orderVoList);
-
-        return ResponseUtil.ok(result);
+        return ResponseUtil.okList(orderVoList, orderList);
     }
 
     /**
@@ -199,16 +191,19 @@ public class WxOrderService {
         Map<String, Object> orderVo = new HashMap<String, Object>();
         orderVo.put("id", order.getId());
         orderVo.put("orderSn", order.getOrderSn());
+        orderVo.put("message", order.getMessage());
         orderVo.put("addTime", order.getAddTime());
         orderVo.put("consignee", order.getConsignee());
         orderVo.put("mobile", order.getMobile());
         orderVo.put("address", order.getAddress());
         orderVo.put("goodsPrice", order.getGoodsPrice());
+        orderVo.put("couponPrice", order.getCouponPrice());
         orderVo.put("freightPrice", order.getFreightPrice());
         orderVo.put("actualPrice", order.getActualPrice());
         orderVo.put("orderStatusText", OrderUtil.orderStatusText(order));
         orderVo.put("handleOption", OrderUtil.build(order));
         orderVo.put("expCode", order.getShipChannel());
+        orderVo.put("expName", expressService.getVendorName(order.getShipChannel()));
         orderVo.put("expNo", order.getShipSn());
 
         List<LitemallOrderGoods> orderGoodsList = orderGoodsService.queryByOid(order.getId());
@@ -221,7 +216,15 @@ public class WxOrderService {
         //"YTO", "800669400640887922"
         if (order.getOrderStatus().equals(OrderUtil.STATUS_SHIP)) {
             ExpressInfo ei = expressService.getExpressInfo(order.getShipChannel(), order.getShipSn());
-            result.put("expressInfo", ei);
+            if(ei == null){
+                result.put("expressInfo", new ArrayList<>());
+            }
+            else {
+                result.put("expressInfo", ei);
+            }
+        }
+        else{
+            result.put("expressInfo", new ArrayList<>());
         }
 
         return ResponseUtil.ok(result);
@@ -252,6 +255,7 @@ public class WxOrderService {
         Integer cartId = JacksonUtil.parseInteger(body, "cartId");
         Integer addressId = JacksonUtil.parseInteger(body, "addressId");
         Integer couponId = JacksonUtil.parseInteger(body, "couponId");
+        Integer userCouponId = JacksonUtil.parseInteger(body, "userCouponId");
         String message = JacksonUtil.parseString(body, "message");
         Integer grouponRulesId = JacksonUtil.parseInteger(body, "grouponRulesId");
         Integer grouponLinkId = JacksonUtil.parseInteger(body, "grouponLinkId");
@@ -274,7 +278,7 @@ public class WxOrderService {
         }
 
         // 收货地址
-        LitemallAddress checkedAddress = addressService.findById(addressId);
+        LitemallAddress checkedAddress = addressService.query(userId, addressId);
         if (checkedAddress == null) {
             return ResponseUtil.badArgument();
         }
@@ -313,7 +317,7 @@ public class WxOrderService {
         BigDecimal couponPrice = new BigDecimal(0.00);
         // 如果couponId=0则没有优惠券，couponId=-1则不使用优惠券
         if (couponId != 0 && couponId != -1) {
-            LitemallCoupon coupon = couponVerifyService.checkCoupon(userId, couponId, checkedGoodsPrice);
+            LitemallCoupon coupon = couponVerifyService.checkCoupon(userId, couponId, userCouponId, checkedGoodsPrice);
             if (coupon == null) {
                 return ResponseUtil.badArgumentValue();
             }
@@ -331,7 +335,7 @@ public class WxOrderService {
         BigDecimal integralPrice = new BigDecimal(0.00);
 
         // 订单费用
-        BigDecimal orderTotalPrice = checkedGoodsPrice.add(freightPrice).subtract(couponPrice);
+        BigDecimal orderTotalPrice = checkedGoodsPrice.add(freightPrice).subtract(couponPrice).max(new BigDecimal(0.00));
         // 最终支付费用
         BigDecimal actualPrice = orderTotalPrice.subtract(integralPrice);
 
@@ -343,9 +347,9 @@ public class WxOrderService {
         order.setOrderSn(orderService.generateOrderSn(userId));
         order.setOrderStatus(OrderUtil.STATUS_CREATE);
         order.setConsignee(checkedAddress.getName());
-        order.setMobile(checkedAddress.getMobile());
+        order.setMobile(checkedAddress.getTel());
         order.setMessage(message);
-        String detailedAddress = detailedAddress(checkedAddress);
+        String detailedAddress = checkedAddress.getProvince() + checkedAddress.getCity() + checkedAddress.getCounty() + " " + checkedAddress.getAddressDetail();
         order.setAddress(detailedAddress);
         order.setGoodsPrice(checkedGoodsPrice);
         order.setFreightPrice(freightPrice);
@@ -402,7 +406,7 @@ public class WxOrderService {
 
         // 如果使用了优惠券，设置优惠券使用状态
         if (couponId != 0 && couponId != -1) {
-            LitemallCouponUser couponUser = couponUserService.queryOne(userId, couponId);
+            LitemallCouponUser couponUser = couponUserService.findById(userCouponId);
             couponUser.setStatus(CouponUserConstant.STATUS_USED);
             couponUser.setUsedTime(LocalDateTime.now());
             couponUser.setOrderId(orderId);
@@ -431,6 +435,9 @@ public class WxOrderService {
 
             grouponService.createGroupon(groupon);
         }
+
+        // 订单支付超期任务
+        taskService.addTask(new OrderUnpaidTask(orderId));
 
         Map<String, Object> data = new HashMap<>();
         data.put("orderId", orderId);
@@ -574,6 +581,60 @@ public class WxOrderService {
     }
 
     /**
+     * 微信H5支付
+     *
+     * @param userId
+     * @param body
+     * @param request
+     * @return
+     */
+    @Transactional
+    public Object h5pay(Integer userId, String body, HttpServletRequest request) {
+        if (userId == null) {
+            return ResponseUtil.unlogin();
+        }
+        Integer orderId = JacksonUtil.parseInteger(body, "orderId");
+        if (orderId == null) {
+            return ResponseUtil.badArgument();
+        }
+
+        LitemallOrder order = orderService.findById(orderId);
+        if (order == null) {
+            return ResponseUtil.badArgumentValue();
+        }
+        if (!order.getUserId().equals(userId)) {
+            return ResponseUtil.badArgumentValue();
+        }
+
+        // 检测是否能够取消
+        OrderHandleOption handleOption = OrderUtil.build(order);
+        if (!handleOption.isPay()) {
+            return ResponseUtil.fail(ORDER_INVALID_OPERATION, "订单不能支付");
+        }
+
+        WxPayMwebOrderResult result = null;
+        try {
+            WxPayUnifiedOrderRequest orderRequest = new WxPayUnifiedOrderRequest();
+            orderRequest.setOutTradeNo(order.getOrderSn());
+            orderRequest.setTradeType("MWEB");
+            orderRequest.setBody("订单：" + order.getOrderSn());
+            // 元转成分
+            int fee = 0;
+            BigDecimal actualPrice = order.getActualPrice();
+            fee = actualPrice.multiply(new BigDecimal(100)).intValue();
+            orderRequest.setTotalFee(fee);
+            orderRequest.setSpbillCreateIp(IpUtil.getIpAddr(request));
+
+            result = wxPayService.createOrder(orderRequest);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
+        return ResponseUtil.ok(result);
+    }
+
+    /**
      * 微信付款成功或失败回调接口
      * <p>
      * 1. 检测当前订单是否是付款状态;
@@ -597,6 +658,15 @@ public class WxOrderService {
         WxPayOrderNotifyResult result = null;
         try {
             result = wxPayService.parseOrderNotifyResult(xmlResult);
+
+            if(!WxPayConstants.ResultCode.SUCCESS.equals(result.getResultCode())){
+                logger.error(xmlResult);
+                throw new WxPayException("微信通知支付失败！");
+            }
+            if(!WxPayConstants.ResultCode.SUCCESS.equals(result.getReturnCode())){
+                logger.error(xmlResult);
+                throw new WxPayException("微信通知支付失败！");
+            }
         } catch (WxPayException e) {
             e.printStackTrace();
             return WxPayNotifyResponse.fail(e.getMessage());
@@ -616,7 +686,7 @@ public class WxOrderService {
         }
 
         // 检查这个订单是否已经处理过
-        if (OrderUtil.isPayStatus(order) && order.getPayId() != null) {
+        if (OrderUtil.hasPayed(order)) {
             return WxPayNotifyResponse.success("订单已经处理成功!");
         }
 
@@ -662,6 +732,37 @@ public class WxOrderService {
             if (grouponService.updateById(groupon) == 0) {
                 return WxPayNotifyResponse.fail("更新数据已失效");
             }
+
+            // 团购已达成，更新关联订单支付状态
+            if (groupon.getGrouponId() > 0) {
+                List<LitemallGroupon> grouponList = grouponService.queryJoinRecord(groupon.getGrouponId());
+                if (grouponList.size() >= grouponRules.getDiscountMember() - 1) {
+                    for (LitemallGroupon grouponActivity : grouponList) {
+                        if (grouponActivity.getOrderId().equals(order.getId())) {
+                            //当前订单
+                            continue;
+                        }
+
+                        LitemallOrder grouponOrder = orderService.findById(grouponActivity.getOrderId());
+                        if (grouponOrder.getOrderStatus().equals(OrderUtil.STATUS_PAY_GROUPON)) {
+                            grouponOrder.setOrderStatus(OrderUtil.STATUS_PAY);
+                            orderService.updateWithOptimisticLocker(grouponOrder);
+                        }
+                    }
+
+                    LitemallGroupon grouponSource = grouponService.queryById(groupon.getGrouponId());
+                    LitemallOrder grouponOrder = orderService.findById(grouponSource.getOrderId());
+                    if (grouponOrder.getOrderStatus().equals(OrderUtil.STATUS_PAY_GROUPON)) {
+                        grouponOrder.setOrderStatus(OrderUtil.STATUS_PAY);
+                        orderService.updateWithOptimisticLocker(grouponOrder);
+                    }
+                }
+
+            } else {
+                order = orderService.findBySn(orderSn);
+                order.setOrderStatus(OrderUtil.STATUS_PAY_GROUPON);
+                orderService.updateWithOptimisticLocker(order);
+            }
         }
 
         //TODO 发送邮件和短信通知，这里采用异步发送
@@ -681,6 +782,9 @@ public class WxOrderService {
         };
 
         notifyService.notifyWxTemplate(result.getOpenid(), NotifyType.PAY_SUCCEED, parms, "pages/index/index?orderId=" + order.getId());
+
+        // 取消订单超时未支付任务
+        taskService.removeTask(new OrderUnpaidTask(order.getId()));
 
         return WxPayNotifyResponse.success("处理成功!");
     }
